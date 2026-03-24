@@ -1,0 +1,1245 @@
+// -*- mode:c++;indent-tabs-mode:nil;c-basic-offset:4;coding:utf-8 -*-
+// vi: set et ft=cpp ts=4 sts=4 sw=4 fenc=utf-8 :vi
+//
+// Copyright 2024 Mozilla Foundation
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+#include "json.h"
+#include "jtckdint.h"
+
+#include <cassert>
+#include <cctype>
+#include <climits>
+#include <cstdint>
+#include <cstdlib>
+#include <stdexcept>
+
+#include "double-to-string.h"
+#include "string-to-double.h"
+
+#define KEY 1
+#define COMMA 2
+#define COLON 4
+#define ARRAY 8
+#define OBJECT 16
+#define DEPTH 20
+
+#define ASCII 0
+#define C0 1
+#define DQUOTE 2
+#define BACKSLASH 3
+#define UTF8_2 4
+#define UTF8_3 5
+#define UTF8_4 6
+#define C1 7
+#define UTF8_3_E0 8
+#define UTF8_3_ED 9
+#define UTF8_4_F0 10
+#define BADUTF8 11
+#define EVILUTF8 12
+
+#define UTF16_MASK 0xfc00
+#define UTF16_MOAR 0xd800 // 0xD800..0xDBFF
+#define UTF16_CONT 0xdc00 // 0xDC00..0xDFFF
+
+#define READ32LE(S) \
+    ((uint_least32_t)(255 & (S)[3]) << 030 | \
+     (uint_least32_t)(255 & (S)[2]) << 020 | \
+     (uint_least32_t)(255 & (S)[1]) << 010 | \
+     (uint_least32_t)(255 & (S)[0]) << 000)
+
+#define ThomPikeCont(x) (0200 == (0300 & (x)))
+#define ThomPikeByte(x) ((x) & (((1 << ThomPikeMsb(x)) - 1) | 3))
+#define ThomPikeLen(x) (7 - ThomPikeMsb(x))
+#define ThomPikeMsb(x) ((255 & (x)) < 252 ? Bsr(255 & ~(x)) : 1)
+#define ThomPikeMerge(x, y) ((x) << 6 | (077 & (y)))
+
+#define IsSurrogate(wc) ((0xf800 & (wc)) == 0xd800)
+#define IsHighSurrogate(wc) (((wc) & UTF16_MASK) == UTF16_MOAR)
+#define IsLowSurrogate(wc) (((wc) & UTF16_MASK) == UTF16_CONT)
+#define MergeUtf16(hi, lo) ((((hi) - 0xD800) << 10) + ((lo) - 0xDC00) + 0x10000)
+#define EncodeUtf16(wc) \
+    ((0x0000 <= (wc) && (wc) <= 0xFFFF) || (0xE000 <= (wc) && (wc) <= 0xFFFF) \
+       ? (wc) \
+     : 0x10000 <= (wc) && (wc) <= 0x10FFFF \
+       ? (((((wc) - 0x10000) >> 10) + 0xD800) | \
+          (unsigned)((((wc) - 0x10000) & 1023) + 0xDC00) << 16) \
+       : 0xFFFD)
+
+#if defined(__cpp_exceptions) || defined(__EXCEPTIONS) || defined(_CPPUNWIND)
+#define ON_LOGIC_ERROR(s) throw std::logic_error(s)
+#else
+#define ON_LOGIC_ERROR(s) abort()
+#endif
+
+namespace jt {
+
+const char kJsonStr[256] = {
+    1,  1,  1,  1,  1,  1,  1,  1, // 0000 ascii (0)
+    1,  1,  1,  1,  1,  1,  1,  1, // 0010
+    1,  1,  1,  1,  1,  1,  1,  1, // 0020 c0 (1)
+    1,  1,  1,  1,  1,  1,  1,  1, // 0030
+    0,  0,  2,  0,  0,  0,  0,  0, // 0040 dquote (2)
+    0,  0,  0,  0,  0,  0,  0,  0, // 0050
+    0,  0,  0,  0,  0,  0,  0,  0, // 0060
+    0,  0,  0,  0,  0,  0,  0,  0, // 0070
+    0,  0,  0,  0,  0,  0,  0,  0, // 0100
+    0,  0,  0,  0,  0,  0,  0,  0, // 0110
+    0,  0,  0,  0,  0,  0,  0,  0, // 0120
+    0,  0,  0,  0,  3,  0,  0,  0, // 0130 backslash (3)
+    0,  0,  0,  0,  0,  0,  0,  0, // 0140
+    0,  0,  0,  0,  0,  0,  0,  0, // 0150
+    0,  0,  0,  0,  0,  0,  0,  0, // 0160
+    0,  0,  0,  0,  0,  0,  0,  0, // 0170
+    7,  7,  7,  7,  7,  7,  7,  7, // 0200 c1 (8)
+    7,  7,  7,  7,  7,  7,  7,  7, // 0210
+    7,  7,  7,  7,  7,  7,  7,  7, // 0220
+    7,  7,  7,  7,  7,  7,  7,  7, // 0230
+    11, 11, 11, 11, 11, 11, 11, 11, // 0240 latin1 (4)
+    11, 11, 11, 11, 11, 11, 11, 11, // 0250
+    11, 11, 11, 11, 11, 11, 11, 11, // 0260
+    11, 11, 11, 11, 11, 11, 11, 11, // 0270
+    12, 12, 4,  4,  4,  4,  4,  4, // 0300 utf8-2 (5)
+    4,  4,  4,  4,  4,  4,  4,  4, // 0310
+    4,  4,  4,  4,  4,  4,  4,  4, // 0320 utf8-2
+    4,  4,  4,  4,  4,  4,  4,  4, // 0330
+    8,  5,  5,  5,  5,  5,  5,  5, // 0340 utf8-3 (6)
+    5,  5,  5,  5,  5,  9,  5,  5, // 0350
+    10, 6,  6,  6,  6,  11, 11, 11, // 0360 utf8-4 (7)
+    11, 11, 11, 11, 11, 11, 11, 11, // 0370
+};
+
+const char kEscapeLiteral[128] = {
+    9, 9, 9, 9, 9, 9, 9, 9, 9, 1, 2, 9, 4, 3, 9, 9, // 0x00
+    9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, // 0x10
+    0, 0, 7, 0, 0, 0, 9, 9, 0, 0, 0, 0, 0, 0, 0, 6, // 0x20
+    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 9, 9, 9, 0, // 0x30
+    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, // 0x40
+    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 5, 0, 0, 0, // 0x50
+    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, // 0x60
+    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 9, // 0x70
+};
+
+alignas(signed char) const signed char kHexToInt[256] = {
+    -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, // 0x00
+    -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, // 0x10
+    -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, // 0x20
+    0,  1,  2,  3,  4,  5,  6,  7,  8,  9,  -1, -1, -1, -1, -1, -1, // 0x30
+    -1, 10, 11, 12, 13, 14, 15, -1, -1, -1, -1, -1, -1, -1, -1, -1, // 0x40
+    -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, // 0x50
+    -1, 10, 11, 12, 13, 14, 15, -1, -1, -1, -1, -1, -1, -1, -1, -1, // 0x60
+    -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, // 0x70
+    -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, // 0x80
+    -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, // 0x90
+    -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, // 0xa0
+    -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, // 0xb0
+    -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, // 0xc0
+    -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, // 0xd0
+    -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, // 0xe0
+    -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, // 0xf0
+};
+
+const double_conversion::DoubleToStringConverter kDoubleToJson(
+  double_conversion::DoubleToStringConverter::UNIQUE_ZERO |
+    double_conversion::DoubleToStringConverter::EMIT_POSITIVE_EXPONENT_SIGN,
+  "1e5000",
+  "null",
+  'e',
+  -6,
+  21,
+  6,
+  0);
+
+const double_conversion::StringToDoubleConverter kJsonToDouble(
+  double_conversion::StringToDoubleConverter::ALLOW_CASE_INSENSITIVITY |
+    double_conversion::StringToDoubleConverter::ALLOW_LEADING_SPACES |
+    double_conversion::StringToDoubleConverter::ALLOW_TRAILING_JUNK |
+    double_conversion::StringToDoubleConverter::ALLOW_TRAILING_SPACES,
+  0.0,
+  1.0,
+  "Infinity",
+  "NaN");
+
+#if defined(__GNUC__) || defined(__clang__)
+#define Bsr(x) (__builtin_clz(x) ^ (sizeof(int) * CHAR_BIT - 1))
+#else
+int
+Bsr(int x)
+{
+    int r = 0;
+    if (x & 0xFFFF0000u) {
+        x >>= 16;
+        r |= 16;
+    }
+    if (x & 0xFF00) {
+        x >>= 8;
+        r |= 8;
+    }
+    if (x & 0xF0) {
+        x >>= 4;
+        r |= 4;
+    }
+    if (x & 0xC) {
+        x >>= 2;
+        r |= 2;
+    }
+    if (x & 0x2) {
+        r |= 1;
+    }
+    return r;
+}
+#endif
+
+double
+StringToDouble(const char* s, size_t n, int* out_processed)
+{
+    if (n == (size_t)-1)
+        n = strlen(s);
+    int processed;
+    double res = kJsonToDouble.StringToDouble(s, n, &processed);
+    if (out_processed)
+        *out_processed = processed;
+    return res;
+}
+
+char*
+UlongToString(char* p, unsigned long long x)
+{
+    char t;
+    size_t i, a, b;
+    i = 0;
+    do {
+        p[i++] = x % 10 + '0';
+        x = x / 10;
+    } while (x > 0);
+    p[i] = '\0';
+    if (i) {
+        for (a = 0, b = i - 1; a < b; ++a, --b) {
+            t = p[a];
+            p[a] = p[b];
+            p[b] = t;
+        }
+    }
+    return p + i;
+}
+
+char*
+LongToString(char* p, long long x)
+{
+    if (x < 0)
+        *p++ = '-', x = 0 - (unsigned long long)x;
+    return UlongToString(p, x);
+}
+
+Json::Json(unsigned long value)
+{
+    if (value <= LLONG_MAX) {
+        type_ = Long;
+        long_value = value;
+    } else {
+        type_ = Double;
+        double_value = value;
+    }
+}
+
+Json::Json(unsigned long long value)
+{
+    if (value <= LLONG_MAX) {
+        type_ = Long;
+        long_value = value;
+    } else {
+        type_ = Double;
+        double_value = value;
+    }
+}
+
+Json::Json(const char* value)
+{
+    if (value) {
+        type_ = String;
+        new (&string_value) std::string(value);
+    } else {
+        type_ = Null;
+    }
+}
+
+Json::Json(const std::string& value) : type_(String), string_value(value)
+{
+}
+
+Json::~Json()
+{
+    if (type_ >= String)
+        clear();
+}
+
+void
+Json::clear()
+{
+    if (type_ == String) {
+        string_value.~basic_string();
+    } else if (type_ == Array) {
+        array_value.~vector();
+    } else if (type_ == Object) {
+        object_value.~map();
+    } else {
+        // no-op for other types
+    }
+    type_ = Null;
+}
+
+Json::Json(const Json& other) : type_(other.type_)
+{
+    if (type_ == Null) {
+    } else if (type_ == Bool) {
+        bool_value = other.bool_value;
+    } else if (type_ == Long) {
+        long_value = other.long_value;
+    } else if (type_ == Float) {
+        float_value = other.float_value;
+    } else if (type_ == Double) {
+        double_value = other.double_value;
+    } else if (type_ == String) {
+        new (&string_value) std::string(other.string_value);
+    } else if (type_ == Array) {
+        new (&array_value) std::vector<Json>(other.array_value);
+    } else if (type_ == Object) {
+        new (&object_value)
+          std::map<std::string, Json>(other.object_value);
+    } else {
+        ON_LOGIC_ERROR("Unhandled JSON type.");
+    }
+}
+
+Json&
+Json::operator=(const Json& other)
+{
+    if (this != &other) {
+        if (type_ >= String)
+            clear();
+        type_ = other.type_;
+        if (type_ == Null) {
+        } else if (type_ == Bool) {
+            bool_value = other.bool_value;
+        } else if (type_ == Long) {
+            long_value = other.long_value;
+        } else if (type_ == Float) {
+            float_value = other.float_value;
+        } else if (type_ == Double) {
+            double_value = other.double_value;
+        } else if (type_ == String) {
+            new (&string_value) std::string(other.string_value);
+        } else if (type_ == Array) {
+            new (&array_value) std::vector<Json>(other.array_value);
+        } else if (type_ == Object) {
+            new (&object_value)
+              std::map<std::string, Json>(other.object_value);
+        } else {
+            ON_LOGIC_ERROR("Unhandled JSON type.");
+        }
+    }
+    return *this;
+}
+
+Json::Json(Json&& other) : type_(other.type_)
+{
+    if (type_ == Null) {
+    } else if (type_ == Bool) {
+        bool_value = other.bool_value;
+    } else if (type_ == Long) {
+        long_value = other.long_value;
+    } else if (type_ == Float) {
+        float_value = other.float_value;
+    } else if (type_ == Double) {
+        double_value = other.double_value;
+    } else if (type_ == String) {
+        new (&string_value) std::string(std::move(other.string_value));
+    } else if (type_ == Array) {
+        new (&array_value) std::vector<Json>(std::move(other.array_value));
+    } else if (type_ == Object) {
+        new (&object_value)
+          std::map<std::string, Json>(std::move(other.object_value));
+    } else {
+        ON_LOGIC_ERROR("Unhandled JSON type.");
+    }
+    other.type_ = Null;
+}
+
+Json&
+Json::operator=(Json&& other)
+{
+    if (this != &other) {
+        if (type_ >= String)
+            clear();
+        type_ = other.type_;
+        if (type_ == Null) {
+        } else if (type_ == Bool) {
+            bool_value = other.bool_value;
+        } else if (type_ == Long) {
+            long_value = other.long_value;
+        } else if (type_ == Float) {
+            float_value = other.float_value;
+        } else if (type_ == Double) {
+            double_value = other.double_value;
+        } else if (type_ == String) {
+            new (&string_value)
+              std::string(std::move(other.string_value));
+        } else if (type_ == Array) {
+            new (&array_value)
+              std::vector<Json>(std::move(other.array_value));
+        } else if (type_ == Object) {
+            new (&object_value)
+              std::map<std::string, Json>(std::move(other.object_value));
+        } else {
+            ON_LOGIC_ERROR("Unhandled JSON type.");
+        }
+        other.type_ = Null;
+    }
+    return *this;
+}
+
+double
+Json::getNumber() const
+{
+    if (type_ == Long) {
+        return long_value;
+    } else if (type_ == Float) {
+        return float_value;
+    } else if (type_ == Double) {
+        return double_value;
+    } else {
+        ON_LOGIC_ERROR("JSON value is not a number.");
+    }
+}
+
+long long
+Json::getLong() const
+{
+    if (type_ == Long) {
+        return long_value;
+    } else {
+        ON_LOGIC_ERROR("JSON value is not a long.");
+    }
+}
+
+bool
+Json::getBool() const
+{
+    if (type_ == Bool) {
+        return bool_value;
+    } else {
+        ON_LOGIC_ERROR("JSON value is not a bool.");
+    }
+}
+
+float
+Json::getFloat() const
+{
+    if (type_ == Float) {
+        return float_value;
+    } else if (type_ == Double) {
+        return double_value;
+    } else {
+        ON_LOGIC_ERROR("JSON value is not a floating-point number.");
+    }
+}
+
+double
+Json::getDouble() const
+{
+    if (type_ == Float) {
+        return float_value;
+    } else if (type_ == Double) {
+        return double_value;
+    } else {
+        ON_LOGIC_ERROR("JSON value is not a floating-point number.");
+    }
+}
+
+std::string&
+Json::getString()
+{
+    if (type_ == String) {
+        return string_value;
+    } else {
+        ON_LOGIC_ERROR("JSON value is not a string.");
+    }
+}
+
+std::vector<Json>&
+Json::getArray()
+{
+    if (type_ == Array) {
+        return array_value;
+    } else {
+        ON_LOGIC_ERROR("JSON value is not an array.");
+    }
+}
+
+std::map<std::string, Json>&
+Json::getObject()
+{
+    if (type_ == Object) {
+        return object_value;
+    } else {
+        ON_LOGIC_ERROR("JSON value is not an object.");
+    }
+}
+
+void
+Json::setArray()
+{
+    if (type_ >= String)
+        clear();
+    type_ = Array;
+    new (&array_value) std::vector<Json>();
+}
+
+void
+Json::setObject()
+{
+    if (type_ >= String)
+        clear();
+    type_ = Object;
+    new (&object_value) std::map<std::string, Json>();
+}
+
+bool
+Json::contains(const std::string& key) const
+{
+    if (!isObject())
+        return false;
+    return object_value.find(key) != object_value.end();
+}
+
+Json&
+Json::operator[](size_t index)
+{
+    if (!isArray())
+        setArray();
+    if (index >= array_value.size()) {
+        array_value.resize(index + 1);
+    }
+    return array_value[index];
+}
+
+Json&
+Json::operator[](const std::string& key)
+{
+    if (!isObject())
+        setObject();
+    return object_value[key];
+}
+
+std::string
+Json::toString() const
+{
+    std::string b;
+    marshal(b, false, 0);
+    return b;
+}
+
+std::string
+Json::toStringPretty() const
+{
+    std::string b;
+    marshal(b, true, 0);
+    return b;
+}
+
+void
+Json::marshal(std::string& b, bool pretty, int indent) const
+{
+    if (type_ == Null) {
+        b += "null";
+    } else if (type_ == String) {
+        stringify(b, string_value);
+    } else if (type_ == Bool) {
+        b += bool_value ? "true" : "false";
+    } else if (type_ == Long) {
+        char buf[64];
+        b.append(buf, LongToString(buf, long_value) - buf);
+    } else if (type_ == Float) {
+        char buf[128];
+        double_conversion::StringBuilder db(buf, 128);
+        kDoubleToJson.ToShortestSingle(float_value, &db);
+        db.Finalize();
+        b += buf;
+    } else if (type_ == Double) {
+        char buf[128];
+        double_conversion::StringBuilder db(buf, 128);
+        kDoubleToJson.ToShortest(double_value, &db);
+        db.Finalize();
+        b += buf;
+    } else if (type_ == Array) {
+        bool once = false;
+        b += '[';
+        for (auto i = array_value.begin(); i != array_value.end(); ++i) {
+            if (once) {
+                b += ',';
+                if (pretty)
+                    b += ' ';
+            } else {
+                once = true;
+            }
+            i->marshal(b, pretty, indent);
+        }
+        b += ']';
+    } else if (type_ == Object) {
+        bool once = false;
+        b += '{';
+        for (auto i = object_value.begin(); i != object_value.end(); ++i) {
+            if (once) {
+                b += ',';
+            } else {
+                once = true;
+            }
+            if (pretty && object_value.size() > 1) {
+                b += '\n';
+                ++indent;
+                for (int j = 0; j < indent; ++j)
+                    b += "  ";
+            }
+            stringify(b, i->first);
+            b += ':';
+            if (pretty)
+                b += ' ';
+            i->second.marshal(b, pretty, indent);
+            if (pretty && object_value.size() > 1)
+                --indent;
+        }
+        if (pretty && object_value.size() > 1) {
+            b += '\n';
+            for (int j = 0; j < indent; ++j)
+                b += "  ";
+            ++indent;
+        }
+        b += '}';
+    } else {
+        ON_LOGIC_ERROR("Unhandled JSON type.");
+    }
+}
+
+void
+Json::stringify(std::string& b, const std::string& s)
+{
+    b += '"';
+    serialize(b, s);
+    b += '"';
+}
+
+void
+Json::serialize(std::string& sb, const std::string& s)
+{
+    size_t i, j, m;
+    wint_t x, a, b;
+    unsigned long long w;
+    for (i = 0; i < s.size();) {
+        x = s[i++] & 255;
+        if (x >= 0300) {
+            a = ThomPikeByte(x);
+            m = ThomPikeLen(x) - 1;
+            if (i + m <= s.size()) {
+                for (j = 0;;) {
+                    b = s[i + j] & 0xff;
+                    if (!ThomPikeCont(b))
+                        break;
+                    a = ThomPikeMerge(a, b);
+                    if (++j == m) {
+                        x = a;
+                        i += j;
+                        break;
+                    }
+                }
+            }
+        }
+        int escape_code = (0 <= x && x <= 127) ? kEscapeLiteral[x] : 9;
+        if (escape_code == 0) {
+            sb += x;
+        } else if (escape_code == 1) {
+            sb += "\\t";
+        } else if (escape_code == 2) {
+            sb += "\\n";
+        } else if (escape_code == 3) {
+            sb += "\\r";
+        } else if (escape_code == 4) {
+            sb += "\\f";
+        } else if (escape_code == 5) {
+            sb += "\\\\";
+        } else if (escape_code == 6) {
+            sb += "\\/";
+        } else if (escape_code == 7) {
+            sb += "\\\"";
+        } else if (escape_code == 9) {
+            w = EncodeUtf16(x);
+            do {
+                char esc[6];
+                esc[0] = '\\';
+                esc[1] = 'u';
+                esc[2] = "0123456789abcdef"[(w & 0xF000) >> 014];
+                esc[3] = "0123456789abcdef"[(w & 0x0F00) >> 010];
+                esc[4] = "0123456789abcdef"[(w & 0x00F0) >> 004];
+                esc[5] = "0123456789abcdef"[(w & 0x000F) >> 000];
+                sb.append(esc, 6);
+            } while ((w >>= 16));
+        } else {
+            ON_LOGIC_ERROR("Unhandled character escape code during string serialization.");
+        }
+    }
+}
+
+Json::Status
+Json::parse(Json& json, const char*& p, const char* e, int context, int depth)
+{
+    char w[4];
+    long long x;
+    const char* a;
+    int A, B, C, D, c, d, i, u;
+    if (!depth)
+        return depth_exceeded;
+    auto parseDouble = [&]() -> Status {
+        json.type_ = Double;
+        json.double_value = StringToDouble(a, e - a, &c);
+        if (c <= 0)
+            return bad_double;
+        if (a + c < e && (a[c] == 'e' || a[c] == 'E'))
+            return bad_exponent;
+        p = a + c;
+        return success;
+    };
+    for (a = p, d = +1; p < e;) {
+        c = *p++ & 255;
+        if (c == ' ' || c == '\n' || c == '\r' || c == '\t') { // spaces
+            a = p;
+        } else if (c == ',') { // present in list and object
+            if (context & COMMA) {
+                context = 0;
+                a = p;
+            } else {
+                return unexpected_comma;
+            }
+        } else if (c == ':') { // present only in object after key
+            if (context & COLON) {
+                context = 0;
+                a = p;
+            } else {
+                return unexpected_colon;
+            }
+        } else if (c == 'n') { // null
+            if (context & (KEY | COLON | COMMA))
+                goto OnColonCommaKey;
+            if (p + 3 <= e && READ32LE(p - 1) == READ32LE("null")) {
+                p += 3;
+                return success;
+            } else {
+                return illegal_character;
+            }
+        } else if (c == 'f') { // false
+            if (context & (KEY | COLON | COMMA))
+                goto OnColonCommaKey;
+            if (p + 4 <= e && READ32LE(p) == READ32LE("alse")) {
+                json.type_ = Bool;
+                json.bool_value = false;
+                p += 4;
+                return success;
+            } else {
+                return illegal_character;
+            }
+        } else if (c == 't') { // true
+            if (context & (KEY | COLON | COMMA))
+                goto OnColonCommaKey;
+            if (p + 3 <= e && READ32LE(p - 1) == READ32LE("true")) {
+                json.type_ = Bool;
+                json.bool_value = true;
+                p += 3;
+                return success;
+            } else {
+                return illegal_character;
+            }
+        } else if (c == '-') { // negative
+            if (context & (COLON | COMMA | KEY))
+                goto OnColonCommaKey;
+            if (p < e && isdigit(*p)) {
+                d = -1;
+            } else {
+                return bad_negative;
+            }
+        } else if (c == '0') { // zero or number
+            if (context & (COLON | COMMA | KEY))
+                goto OnColonCommaKey;
+            if (p < e) {
+                if (*p == '.') {
+                    if (p + 1 == e || !isdigit(p[1]))
+                        return bad_double;
+                    return parseDouble();
+                } else if (*p == 'e' || *p == 'E') {
+                    return parseDouble();
+                } else if (isdigit(*p)) {
+                    return unexpected_octal;
+                }
+            }
+            json.type_ = Long;
+            json.long_value = 0;
+            return success;
+        } else if (c >= '1' && c <= '9') { // integer
+            if (context & (COLON | COMMA | KEY))
+                goto OnColonCommaKey;
+            for (x = (c - '0') * d; p < e; ++p) {
+                c = *p & 255;
+                if (isdigit(c)) {
+                    if (ckd_mul(&x, x, 10) ||
+                        ckd_add(&x, x, (c - '0') * d)) {
+                        return parseDouble();
+                    }
+                } else if (c == '.') {
+                    if (p + 1 == e || !isdigit(p[1]))
+                        return bad_double;
+                    return parseDouble();
+                } else if (c == 'e' || c == 'E') {
+                    return parseDouble();
+                } else {
+                    break;
+                }
+            }
+            json.type_ = Long;
+            json.long_value = x;
+            return success;
+        } else if (c == '[') { // Array
+            if (context & (COLON | COMMA | KEY))
+                goto OnColonCommaKey;
+            json.setArray();
+            Json value;
+            for (context = ARRAY, i = 0;;) {
+                Status status = parse(value, p, e, context, depth - 1);
+                if (status == absent_value)
+                    return success;
+                if (status != success)
+                    return status;
+                json.array_value.emplace_back(std::move(value));
+                context = ARRAY | COMMA;
+            }
+        } else if (c == ']') {
+            if (context & ARRAY)
+                return absent_value;
+            return unexpected_end_of_array;
+        } else if (c == '}') {
+            if (context & OBJECT)
+                return absent_value;
+            return unexpected_end_of_object;
+        } else if (c == '{') { // Object
+            if (context & (COLON | COMMA | KEY))
+                goto OnColonCommaKey;
+            json.setObject();
+            context = KEY | OBJECT;
+            Json key, value;
+            for (;;) {
+                Status status = parse(key, p, e, context, depth - 1);
+                if (status == absent_value)
+                    return success;
+                if (status != success)
+                    return status;
+                if (!key.isString())
+                    return object_key_must_be_string;
+                status = parse(value, p, e, COLON, depth - 1);
+                if (status == absent_value)
+                    return object_missing_value;
+                if (status != success)
+                    return status;
+                json.object_value.emplace(std::move(key.string_value),
+                                          std::move(value));
+                context = KEY | COMMA | OBJECT;
+                key.clear();
+            }
+        } else if (c == '"') { // string
+            std::string b;
+            if (context & (COLON | COMMA))
+                goto OnColonComma;
+            auto encodeUtf8 = [&]() {
+                if (c <= 0x7f) {
+                    w[0] = c;
+                    i = 1;
+                } else if (c <= 0x7ff) {
+                    w[0] = 0300 | (c >> 6);
+                    w[1] = 0200 | (c & 077);
+                    i = 2;
+                } else if (c <= 0xffff) {
+                    if (IsSurrogate(c))
+                        c = 0xfffd;
+                    w[0] = 0340 | (c >> 12);
+                    w[1] = 0200 | ((c >> 6) & 077);
+                    w[2] = 0200 | (c & 077);
+                    i = 3;
+                } else if (~(c >> 18) & 007) {
+                    w[0] = 0360 | (c >> 18);
+                    w[1] = 0200 | ((c >> 12) & 077);
+                    w[2] = 0200 | ((c >> 6) & 077);
+                    w[3] = 0200 | (c & 077);
+                    i = 4;
+                } else {
+                    c = 0xfffd;
+                    w[0] = 0340 | (c >> 12);
+                    w[1] = 0200 | ((c >> 6) & 077);
+                    w[2] = 0200 | (c & 077);
+                    i = 3;
+                }
+                b.append(w, i);
+            };
+            for (;;) {
+                if (p >= e)
+                    return unexpected_end_of_string;
+                c = *p++ & 255;
+                int category = kJsonStr[c];
+                if (category == ASCII) {
+                    b += c;
+                } else if (category == DQUOTE) {
+                    json.type_ = String;
+                    new (&json.string_value) std::string(std::move(b));
+                    return success;
+                } else if (category == BACKSLASH) {
+                    if (p >= e)
+                        return unexpected_end_of_string;
+                    c = *p++ & 255;
+                    if (c == '"' || c == '/' || c == '\\') {
+                        b += c;
+                    } else if (c == 'b') {
+                        b += '\b';
+                    } else if (c == 'f') {
+                        b += '\f';
+                    } else if (c == 'n') {
+                        b += '\n';
+                    } else if (c == 'r') {
+                        b += '\r';
+                    } else if (c == 't') {
+                        b += '\t';
+                    } else if (c == 'x') {
+                        if (p + 2 <= e && //
+                            (A = kHexToInt[p[0] & 255]) !=
+                              -1 && // HEX
+                            (B = kHexToInt[p[1] & 255]) != -1) { //
+                            c = A << 4 | B;
+                            if (!(0x20 <= c && c <= 0x7E))
+                                return hex_escape_not_printable;
+                            p += 2;
+                            b += c;
+                        } else {
+                            return invalid_hex_escape;
+                        }
+                    } else if (c == 'u') {
+                        if (p + 4 <= e && //
+                            (A = kHexToInt[p[0] & 255]) != -1 && //
+                            (B = kHexToInt[p[1] & 255]) !=
+                              -1 && // UCS-2
+                            (C = kHexToInt[p[2] & 255]) != -1 && //
+                            (D = kHexToInt[p[3] & 255]) != -1) { //
+                            c = A << 12 | B << 8 | C << 4 | D;
+                            if (!IsSurrogate(c)) {
+                                p += 4;
+                            } else if (IsHighSurrogate(c)) {
+                                if (p + 4 + 6 <= e && //
+                                    p[4] == '\\' && //
+                                    p[5] == 'u' && //
+                                    (A = kHexToInt[p[6] & 255]) !=
+                                      -1 && // UTF-16
+                                    (B = kHexToInt[p[7] & 255]) !=
+                                      -1 && //
+                                    (C = kHexToInt[p[8] & 255]) !=
+                                      -1 && //
+                                    (D = kHexToInt[p[9] & 255]) !=
+                                      -1) { //
+                                    u =
+                                      A << 12 | B << 8 | C << 4 | D;
+                                    if (IsLowSurrogate(u)) {
+                                        p += 4 + 6;
+                                        c = MergeUtf16(c, u);
+                                    } else {
+                                        // Echo invalid \uXXXX sequences
+                                        b += "\\u";
+                                        continue;
+                                    }
+                                } else {
+                                    // Echo invalid \uXXXX sequences
+                                    b += "\\u";
+                                    continue;
+                                }
+                            } else {
+                                // Echo invalid \uXXXX sequences
+                                b += "\\u";
+                                continue;
+                            }
+                            // UTF-8
+                            encodeUtf8();
+                        } else {
+                            return invalid_unicode_escape;
+                        }
+                    } else {
+                        return invalid_escape_character;
+                    }
+                } else if (category == UTF8_2) {
+                    if (p < e && //
+                        (p[0] & 0300) == 0200) { //
+                        c = (c & 037) << 6 | //
+                            (p[0] & 077); //
+                        p += 1;
+                        encodeUtf8();
+                    } else {
+                        return malformed_utf8;
+                    }
+                } else if (category == UTF8_3_E0) {
+                    if (p + 2 <= e && //
+                        (p[0] & 0377) < 0240 && //
+                        (p[0] & 0300) == 0200 && //
+                        (p[1] & 0300) == 0200) {
+                        return overlong_utf8_0x7ff;
+                    }
+                    // fallthrough to UTF8_3 handling
+                    if (p + 2 <= e && //
+                        (p[0] & 0300) == 0200 && //
+                        (p[1] & 0300) == 0200) { //
+                        c = (c & 017) << 12 | //
+                            (p[0] & 077) << 6 | //
+                            (p[1] & 077); //
+                        p += 2;
+                        encodeUtf8();
+                    } else {
+                        return malformed_utf8;
+                    }
+                } else if (category == UTF8_3) {
+                    if (p + 2 <= e && //
+                        (p[0] & 0300) == 0200 && //
+                        (p[1] & 0300) == 0200) { //
+                        c = (c & 017) << 12 | //
+                            (p[0] & 077) << 6 | //
+                            (p[1] & 077); //
+                        p += 2;
+                        encodeUtf8();
+                    } else {
+                        return malformed_utf8;
+                    }
+                } else if (category == UTF8_3_ED) {
+                    if (p + 2 <= e && //
+                        (p[0] & 0377) >= 0240) { //
+                        if (p + 5 <= e && //
+                            (p[0] & 0377) >= 0256 && //
+                            (p[1] & 0300) == 0200 && //
+                            (p[2] & 0377) == 0355 && //
+                            (p[3] & 0377) >= 0260 && //
+                            (p[4] & 0300) == 0200) { //
+                            A = (0355 & 017) << 12 | // CESU-8
+                                (p[0] & 077) << 6 | //
+                                (p[1] & 077); //
+                            B = (0355 & 017) << 12 | //
+                                (p[3] & 077) << 6 | //
+                                (p[4] & 077); //
+                            c = ((A - 0xDB80) << 10) + //
+                                ((B - 0xDC00) + 0x10000); //
+                            p += 5;
+                            encodeUtf8();
+                        } else if ((p[0] & 0300) == 0200 && //
+                                   (p[1] & 0300) == 0200) { //
+                            return utf16_surrogate_in_utf8;
+                        } else {
+                            return malformed_utf8;
+                        }
+                    } else {
+                        // fallthrough to UTF8_3 handling
+                        if (p + 2 <= e && //
+                            (p[0] & 0300) == 0200 && //
+                            (p[1] & 0300) == 0200) { //
+                            c = (c & 017) << 12 | //
+                                (p[0] & 077) << 6 | //
+                                (p[1] & 077); //
+                            p += 2;
+                            encodeUtf8();
+                        } else {
+                            return malformed_utf8;
+                        }
+                    }
+                } else if (category == UTF8_4_F0) {
+                    if (p + 3 <= e && (p[0] & 0377) < 0220 &&
+                        (((uint_least32_t)(p[+2] & 0377) << 030 |
+                          (uint_least32_t)(p[+1] & 0377) << 020 |
+                          (uint_least32_t)(p[+0] & 0377) << 010 |
+                          (uint_least32_t)(p[-1] & 0377) << 000) &
+                         0xC0C0C000) == 0x80808000) {
+                        return overlong_utf8_0xffff;
+                    }
+                    // fallthrough to UTF8_4 handling
+                    if (p + 3 <= e && //
+                        ((A =
+                            ((uint_least32_t)(p[+2] & 0377) << 030 | //
+                             (uint_least32_t)(p[+1] & 0377) << 020 | //
+                             (uint_least32_t)(p[+0] & 0377) << 010 | //
+                             (uint_least32_t)(p[-1] & 0377)
+                               << 000)) & //
+                         0xC0C0C000) == 0x80808000) { //
+                        A = (A & 7) << 18 | //
+                            (A & (077 << 010)) << (12 - 010) | //
+                            (A & (077 << 020)) >> -(6 - 020) | //
+                            (A & (077 << 030)) >> 030; //
+                        if (A <= 0x10FFFF) {
+                            c = A;
+                            p += 3;
+                            encodeUtf8();
+                        } else {
+                            return utf8_exceeds_utf16_range;
+                        }
+                    } else {
+                        return malformed_utf8;
+                    }
+                } else if (category == UTF8_4) {
+                    if (p + 3 <= e && //
+                        ((A =
+                            ((uint_least32_t)(p[+2] & 0377) << 030 | //
+                             (uint_least32_t)(p[+1] & 0377) << 020 | //
+                             (uint_least32_t)(p[+0] & 0377) << 010 | //
+                             (uint_least32_t)(p[-1] & 0377)
+                               << 000)) & //
+                         0xC0C0C000) == 0x80808000) { //
+                        A = (A & 7) << 18 | //
+                            (A & (077 << 010)) << (12 - 010) | //
+                            (A & (077 << 020)) >> -(6 - 020) | //
+                            (A & (077 << 030)) >> 030; //
+                        if (A <= 0x10FFFF) {
+                            c = A;
+                            p += 3;
+                            encodeUtf8();
+                        } else {
+                            return utf8_exceeds_utf16_range;
+                        }
+                    } else {
+                        return malformed_utf8;
+                    }
+                } else if (category == EVILUTF8) {
+                    if (p < e && (p[0] & 0300) == 0200)
+                        return overlong_ascii;
+                    return illegal_utf8_character;
+                } else if (category == BADUTF8) {
+                    return illegal_utf8_character;
+                } else if (category == C0) {
+                    return non_del_c0_control_code_in_string;
+                } else if (category == C1) {
+                    return c1_control_code_in_string;
+                } else {
+                    ON_LOGIC_ERROR("Unhandled character category during string parsing.");
+                }
+            }
+        } else {
+            return illegal_character;
+        }
+
+    OnColonCommaKey:
+        if (context & KEY)
+            return object_key_must_be_string;
+    OnColonComma:
+        if (context & COLON)
+            return missing_colon;
+        return missing_comma;
+    }
+    if (depth == DEPTH)
+        return absent_value;
+    return unexpected_eof;
+}
+
+std::pair<Json::Status, Json>
+Json::parse(const std::string& s)
+{
+    Json::Status s2;
+    std::pair<Json::Status, Json> res;
+    const char* p = s.data();
+    const char* e = s.data() + s.size();
+    res.first = parse(res.second, p, e, 0, DEPTH);
+    if (res.first == Json::success) {
+        Json j2;
+        s2 = parse(j2, p, e, 0, DEPTH);
+        if (s2 != absent_value)
+            res.first = trailing_content;
+    }
+    return res;
+}
+
+const char*
+Json::StatusToString(Json::Status status)
+{
+    if (status == success) {
+        return "success";
+    } else if (status == bad_double) {
+        return "bad_double";
+    } else if (status == absent_value) {
+        return "absent_value";
+    } else if (status == bad_negative) {
+        return "bad_negative";
+    } else if (status == bad_exponent) {
+        return "bad_exponent";
+    } else if (status == missing_comma) {
+        return "missing_comma";
+    } else if (status == missing_colon) {
+        return "missing_colon";
+    } else if (status == malformed_utf8) {
+        return "malformed_utf8";
+    } else if (status == depth_exceeded) {
+        return "depth_exceeded";
+    } else if (status == stack_overflow) {
+        return "stack_overflow";
+    } else if (status == unexpected_eof) {
+        return "unexpected_eof";
+    } else if (status == overlong_ascii) {
+        return "overlong_ascii";
+    } else if (status == unexpected_comma) {
+        return "unexpected_comma";
+    } else if (status == unexpected_colon) {
+        return "unexpected_colon";
+    } else if (status == unexpected_octal) {
+        return "unexpected_octal";
+    } else if (status == trailing_content) {
+        return "trailing_content";
+    } else if (status == illegal_character) {
+        return "illegal_character";
+    } else if (status == invalid_hex_escape) {
+        return "invalid_hex_escape";
+    } else if (status == overlong_utf8_0x7ff) {
+        return "overlong_utf8_0x7ff";
+    } else if (status == overlong_utf8_0xffff) {
+        return "overlong_utf8_0xffff";
+    } else if (status == object_missing_value) {
+        return "object_missing_value";
+    } else if (status == illegal_utf8_character) {
+        return "illegal_utf8_character";
+    } else if (status == invalid_unicode_escape) {
+        return "invalid_unicode_escape";
+    } else if (status == utf16_surrogate_in_utf8) {
+        return "utf16_surrogate_in_utf8";
+    } else if (status == unexpected_end_of_array) {
+        return "unexpected_end_of_array";
+    } else if (status == hex_escape_not_printable) {
+        return "hex_escape_not_printable";
+    } else if (status == invalid_escape_character) {
+        return "invalid_escape_character";
+    } else if (status == utf8_exceeds_utf16_range) {
+        return "utf8_exceeds_utf16_range";
+    } else if (status == unexpected_end_of_string) {
+        return "unexpected_end_of_string";
+    } else if (status == unexpected_end_of_object) {
+        return "unexpected_end_of_object";
+    } else if (status == object_key_must_be_string) {
+        return "object_key_must_be_string";
+    } else if (status == c1_control_code_in_string) {
+        return "c1_control_code_in_string";
+    } else if (status == non_del_c0_control_code_in_string) {
+        return "non_del_c0_control_code_in_string";
+    } else {
+        ON_LOGIC_ERROR("Unhandled Json status value.");
+    }
+}
+
+} // namespace jt
